@@ -8,11 +8,11 @@ import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
+import time
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import Dataset
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -20,11 +20,10 @@ from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
-from PIL import Image
-from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
+from datamodules import DreamBoothDataset, PromptDataset, LatentsDataset
 
 torch.backends.cudnn.benchmark = True
 
@@ -243,8 +242,9 @@ def parse_args(input_args=None):
             "and an Nvidia Ampere GPU."
         ),
     )
-    parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
-    parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
+    parser.add_argument(
+        "--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE."
+    )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
         "--concepts_list",
@@ -263,117 +263,6 @@ def parse_args(input_args=None):
         args.local_rank = env_local_rank
 
     return args
-
-
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        concepts_list,
-        tokenizer,
-        with_prior_preservation=True,
-        size=512,
-        center_crop=False,
-        num_class_images=None,
-        pad_tokens=False,
-        hflip=False
-    ):
-        self.size = size
-        self.center_crop = center_crop
-        self.tokenizer = tokenizer
-        self.with_prior_preservation = with_prior_preservation
-        self.pad_tokens = pad_tokens
-
-        self.instance_images_path = []
-        self.class_images_path = []
-
-        for concept in concepts_list:
-            inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
-            self.instance_images_path.extend(inst_img_path)
-
-            if with_prior_preservation:
-                class_img_path = [(x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()]
-                self.class_images_path.extend(class_img_path[:num_class_images])
-
-        random.shuffle(self.instance_images_path)
-        self.num_instance_images = len(self.instance_images_path)
-        self.num_class_images = len(self.class_images_path)
-        self._length = max(self.num_class_images, self.num_instance_images)
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(0.5 * hflip),
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        instance_path, instance_prompt = self.instance_images_path[index % self.num_instance_images]
-        instance_image = Image.open(instance_path)
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            instance_prompt,
-            padding="max_length" if self.pad_tokens else "do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        ).input_ids
-
-        if self.with_prior_preservation:
-            class_path, class_prompt = self.class_images_path[index % self.num_class_images]
-            class_image = Image.open(class_path)
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt_ids"] = self.tokenizer(
-                class_prompt,
-                padding="max_length" if self.pad_tokens else "do_not_pad",
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-            ).input_ids
-
-        return example
-
-
-class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
-
-    def __init__(self, prompt, num_samples):
-        self.prompt = prompt
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt
-        example["index"] = index
-        return example
-
-
-class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache):
-        self.latents_cache = latents_cache
-        self.text_encoder_cache = text_encoder_cache
-
-    def __len__(self):
-        return len(self.latents_cache)
-
-    def __getitem__(self, index):
-        return self.latents_cache[index], self.text_encoder_cache[index]
 
 
 class AverageMeter:
@@ -428,7 +317,7 @@ def main(args):
                 "instance_prompt": args.instance_prompt,
                 "class_prompt": args.class_prompt,
                 "instance_data_dir": args.instance_data_dir,
-                "class_data_dir": args.class_data_dir
+                "class_data_dir": args.class_data_dir,
             }
         ]
     else:
@@ -455,7 +344,7 @@ def main(args):
                         ),
                         torch_dtype=torch_dtype,
                         safety_checker=None,
-                        revision=args.revision
+                        revision=args.revision,
                     )
                     pipeline.set_progress_bar_config(disable=True)
                     pipeline.to(accelerator.device)
@@ -470,18 +359,23 @@ def main(args):
 
                 with torch.autocast("cuda"), torch.inference_mode():
                     for example in tqdm(
-                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                        sample_dataloader,
+                        desc="Generating class images",
+                        disable=not accelerator.is_local_main_process,
                     ):
                         images = pipeline(example["prompt"]).images
 
                         for i, image in enumerate(images):
                             hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                            image_filename = (
+                                class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                            )
                             image.save(image_filename)
 
         del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            time.sleep(2)
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -562,7 +456,6 @@ def main(args):
         center_crop=args.center_crop,
         num_class_images=args.num_class_images,
         pad_tokens=args.pad_tokens,
-        hflip=args.hflip
     )
 
     def collate_fn(examples):
@@ -612,7 +505,9 @@ def main(args):
         text_encoder_cache = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
+                batch["pixel_values"] = batch["pixel_values"].to(
+                    accelerator.device, non_blocking=True, dtype=weight_dtype
+                )
                 batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
                 if args.train_text_encoder:
@@ -620,13 +515,17 @@ def main(args):
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
         train_dataset = LatentsDataset(latents_cache, text_encoder_cache)
-        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True
+        )
 
         del vae
         if not args.train_text_encoder:
             del text_encoder
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # sleep to avoid OOM; cache emptying is async call
+        time.sleep(2)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -681,8 +580,16 @@ def main(args):
             if args.train_text_encoder:
                 text_enc_model = accelerator.unwrap_model(text_encoder)
             else:
-                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
-            scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
+                text_enc_model = CLIPTextModel.from_pretrained(
+                    args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+                )
+            scheduler = DDIMScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                clip_sample=False,
+                set_alpha_to_one=False,
+            )
             pipeline = StableDiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=accelerator.unwrap_model(unet).to(torch.float16),
@@ -715,12 +622,13 @@ def main(args):
                             negative_prompt=args.save_sample_negative_prompt,
                             guidance_scale=args.save_guidance_scale,
                             num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
+                            generator=g_cuda,
                         ).images
                         images[0].save(os.path.join(sample_dir, f"{i}.png"))
                 del pipeline
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    time.sleep(2)
             print(f"[*] Weights saved at {save_dir}")
             unet.to(torch.float32)
             text_enc_model.to(torch.float32)
