@@ -50,10 +50,15 @@ class DreamBoothDataset(Dataset):
         self.num_class_images = len(self.class_images_path)
         self._length = max(self.num_class_images, self.num_instance_images)
 
+        # may want to consider applying different transforms for class and instance images.
+
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.RandomHorizontalFlip(),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.RandomAffine(degrees=(-2, 2), translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.RandomGrayscale(p=0.05),  # might be useful for the model to learn the color of the object
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
