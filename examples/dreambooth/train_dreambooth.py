@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 import time
+import gc
 
 import torch
 import torch.nn.functional as F
@@ -279,14 +280,92 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
+def prepare_sd_pipeline(
+    pretrained_model,
+    device,  # TODO: remove this arguement; shld avoid casting to device
+    pretrained_vae=None,
+    torch_dtype=torch.float16,
+    revision="main",
+):
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        pretrained_model,
+        vae=AutoencoderKL.from_pretrained(
+            pretrained_vae or pretrained_model,
+            subfolder=None if pretrained_vae else "vae",
+            revision=None if pretrained_vae else revision,
+            torch_dtype=torch_dtype,
+        ),
+        torch_dtype=torch_dtype,
+        safety_checker=None,
+        revision=revision,
+    )
+    pipeline.set_progress_bar_config(disable=True)
+    print(device)
+    pipeline.to(device)  # removing this line results in error:
+    # RuntimeError: "LayerNormKernelImpl" not implemented for 'Half'
+    return pipeline
+
+
+def count_class_images(class_images_dir):
+    class_images_dir.mkdir(parents=True, exist_ok=True)
+    num_class_images = len(list(class_images_dir.iterdir()))
+    return num_class_images
+
+
+def prepare_class_data(
+    # reorder arguments...
+    concept,
+    num_class_images,
+    batch_size,
+    accelerator,  # remove this once possible
+    pipeline,
+):
+    """
+    Use class prompt to prepare more class data if needed
+
+    There is a clear setup and teardown process here that can be better handled.
+    Perhaps with a context manager.
+    """
+
+    # precondition: not enough class images
+    # this can be done in a separate process
+    class_images_dir = Path(concept["class_data_dir"])
+    class_images_dir.mkdir(parents=True, exist_ok=True)
+    cur_class_images = len(list(class_images_dir.iterdir()))
+
+    # generate class images if not enough
+    if cur_class_images < num_class_images:
+        num_new_images = num_class_images - cur_class_images
+        logger.info(f"Number of class images to sample: {num_new_images}.")
+
+        sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
+        sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=batch_size)
+
+        sample_dataloader = accelerator.prepare(sample_dataloader)
+
+        with torch.autocast("cuda"), torch.inference_mode():
+            for example in tqdm(
+                sample_dataloader,
+                desc="Generating class images",
+                disable=not accelerator.is_local_main_process,
+            ):
+                images = pipeline(example["prompt"]).images
+
+                for i, image in enumerate(images):
+                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                    image.save(image_filename)
+
+
+def teardown(*vars):
+    for var in vars:
+        del var
+    # clear the caches
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    # sleep to avoid OOM; cache emptying is async call
+    time.sleep(2)
 
 
 def main(args):
@@ -312,6 +391,7 @@ def main(args):
         set_seed(args.seed)
 
     if args.concepts_list is None:
+        # default is 1 concept, which contains an instance and a class.
         args.concepts_list = [
             {
                 "instance_prompt": args.instance_prompt,
@@ -325,57 +405,18 @@ def main(args):
             args.concepts_list = json.load(f)
 
     if args.with_prior_preservation:
-        pipeline = None
+        # TODO: for multiple concepts, re-use pipeline (1 setup only) via context manager
         for concept in args.concepts_list:
-            class_images_dir = Path(concept["class_data_dir"])
-            class_images_dir.mkdir(parents=True, exist_ok=True)
-            cur_class_images = len(list(class_images_dir.iterdir()))
-
-            if cur_class_images < args.num_class_images:
-                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-                if pipeline is None:
-                    pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        vae=AutoencoderKL.from_pretrained(
-                            args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
-                            subfolder=None if args.pretrained_vae_name_or_path else "vae",
-                            revision=None if args.pretrained_vae_name_or_path else args.revision,
-                            torch_dtype=torch_dtype
-                        ),
-                        torch_dtype=torch_dtype,
-                        safety_checker=None,
-                        revision=args.revision,
-                    )
-                    pipeline.set_progress_bar_config(disable=True)
-                    pipeline.to(accelerator.device)
-
-                num_new_images = args.num_class_images - cur_class_images
-                logger.info(f"Number of class images to sample: {num_new_images}.")
-
-                sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
-                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-                sample_dataloader = accelerator.prepare(sample_dataloader)
-
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for example in tqdm(
-                        sample_dataloader,
-                        desc="Generating class images",
-                        disable=not accelerator.is_local_main_process,
-                    ):
-                        images = pipeline(example["prompt"]).images
-
-                        for i, image in enumerate(images):
-                            hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = (
-                                class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                            )
-                            image.save(image_filename)
-
-        del pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            time.sleep(2)
+            if count_class_images(Path(concept["class_data_dir"])) >= args.num_class_images:
+                continue
+            pipeline = prepare_sd_pipeline(
+                args.pretrained_model_name_or_path,
+                accelerator.device,
+                pretrained_vae=args.pretrained_vae_name_or_path,
+                torch_dtype=torch.float16 if accelerator.device.type == "cuda" else torch.float32,
+            )
+            prepare_class_data(concept, args.num_class_images, args.sample_batch_size, accelerator, pipeline)
+            teardown(pipeline)
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -402,10 +443,7 @@ def main(args):
         revision=args.revision,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-        torch_dtype=torch.float32
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, torch_dtype=torch.float32
     )
 
     vae.requires_grad_(False)
@@ -459,6 +497,7 @@ def main(args):
     )
 
     def collate_fn(examples):
+        # could probably be replaced by concat dataset
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
 
@@ -522,10 +561,7 @@ def main(args):
         del vae
         if not args.train_text_encoder:
             del text_encoder
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # sleep to avoid OOM; cache emptying is async call
-        time.sleep(2)
+        teardown()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -625,10 +661,7 @@ def main(args):
                             generator=g_cuda,
                         ).images
                         images[0].save(os.path.join(sample_dir, f"{i}.png"))
-                del pipeline
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    time.sleep(2)
+                teardown(pipeline)
             print(f"[*] Weights saved at {save_dir}")
             unet.to(torch.float32)
             text_enc_model.to(torch.float32)
