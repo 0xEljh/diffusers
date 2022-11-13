@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 import time
 import gc
+import wandb
 
 import torch
 import torch.nn.functional as F
@@ -365,10 +366,12 @@ def teardown(*vars):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     # sleep to avoid OOM; cache emptying is async call
-    time.sleep(2)
+    time.sleep(4)
 
 
 def main(args):
+    wandb.init(project="dreambooth-diffusers", config=args)
+
     logging_dir = Path(args.output_dir, "0", args.logging_dir)
 
     accelerator = Accelerator(
@@ -743,6 +746,7 @@ def main(args):
                 logs = {"loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
+                wandb.log({"step": global_step, "loss": loss_avg.avg.item()})
 
             if global_step > 0 and not global_step % args.save_interval and global_step >= args.save_min_steps:
                 save_weights(global_step)
@@ -752,8 +756,10 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+            
 
         accelerator.wait_for_everyone()
+
 
     save_weights(global_step)
 
