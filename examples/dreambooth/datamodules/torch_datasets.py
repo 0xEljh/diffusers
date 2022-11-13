@@ -7,6 +7,20 @@ from torchvision import transforms
 
 from PIL import Image
 
+text_templates = [
+    "a painting of {}",
+    "a photo of {}",
+    "a picture of {}",
+    # "a drawing of {}",
+    # "a sketch of {}",
+    "a portrait of {}",
+    "an image of {}",
+]
+
+
+def word_count(text):
+    return len(text.split(" "))
+
 
 class DreamBoothDataset(Dataset):
     """
@@ -51,14 +65,44 @@ class DreamBoothDataset(Dataset):
         self._length = max(self.num_class_images, self.num_instance_images)
 
         # may want to consider applying different transforms for class and instance images.
+        # class images can be augmented more heavily
 
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.RandomHorizontalFlip(),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.RandomAffine(degrees=(-2, 2), translate=(0.1, 0.1), scale=(0.9, 1.1)),
-                transforms.RandomGrayscale(p=0.05),  # might be useful for the model to learn the color of the object
+                transforms.RandomApply(
+                    torch.nn.ModuleList(
+                        [
+                            transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2, hue=0.1),
+                            transforms.RandomAffine(degrees=(-10, 10), translate=(0.2, 0.2), scale=(0.8, 1.2)),
+                        ]
+                    ),
+                    p=0.1,
+                ),
+                transforms.RandomGrayscale(p=0.02),  # might be useful for the model to learn the color of the object
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+        # augmentation pipeline for regularization/class images
+        self.reg_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.RandomApply(
+                    torch.nn.ModuleList(
+                        [
+                            transforms.ColorJitter(brightness=0.4, contrast=0.3, saturation=0.3, hue=0.2),
+                            transforms.RandomAffine(degrees=(-20, 20), translate=(0.2, 0.2), scale=(0.8, 1.2)),
+                        ]
+                    ),
+                    p=0.7,
+                ),
+                transforms.RandomGrayscale(p=0.1),  # might be useful for the model to learn the color of the object
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -68,11 +112,17 @@ class DreamBoothDataset(Dataset):
         return self._length
 
     def __getitem__(self, index):
+
         example = {}
         instance_path, instance_prompt = self.instance_images_path[index % self.num_instance_images]
         instance_image = Image.open(instance_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
+        # replace instance prompt with a random text template if it is just a single word + identifier
+        # find identifier in the prompt and remove it for counting the number of words
+        # currently assume identifier is sks
+        if word_count(instance_prompt.replace("sks", "")) > 1:
+            instance_prompt = random.choice(text_templates).format(instance_prompt)
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
@@ -83,10 +133,15 @@ class DreamBoothDataset(Dataset):
 
         if self.with_prior_preservation:
             class_path, class_prompt = self.class_images_path[index % self.num_class_images]
+
+            if word_count(class_prompt) > 1:
+                class_prompt = random.choice(text_templates).format(class_prompt)
+
             class_image = Image.open(class_path)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
+            # example["class_images"] = self.image_transforms(class_image)
+            example["class_images"] = self.reg_transforms(class_image)
             example["class_prompt_ids"] = self.tokenizer(
                 class_prompt,
                 padding="max_length" if self.pad_tokens else "do_not_pad",
