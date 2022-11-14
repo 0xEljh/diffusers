@@ -26,6 +26,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from datamodules import DreamBoothDataset, PromptDataset, LatentsDataset
+from optimizers.lr_schedulers import LRReduceOnPlateauWrapper, LRReduceOnPlateauComposer
 
 torch.backends.cudnn.benchmark = True
 
@@ -301,7 +302,6 @@ def prepare_sd_pipeline(
         revision=revision,
     )
     pipeline.set_progress_bar_config(disable=True)
-    print(device)
     pipeline.to(device)  # removing this line results in error:
     # RuntimeError: "LayerNormKernelImpl" not implemented for 'Half'
     return pipeline
@@ -579,6 +579,26 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
+    # lr_scheduler = LRReduceOnPlateauWrapper(
+    #     optimizer,
+    #     mode="min",
+    #     factor=0.5,
+    #     patience=100,
+    #     cooldown=50,
+    #     verbose=True,
+    #     threshold=0.0001,
+    #     threshold_mode="rel",
+    # )
+    lr_scheduler = LRReduceOnPlateauComposer(
+        lr_scheduler,
+        mode="min",
+        factor=0.5,
+        patience=100,
+        cooldown=50,
+        verbose=True,
+        threshold=0.0001,
+        threshold_mode="rel",
+    )
 
     if args.train_text_encoder:
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -738,9 +758,10 @@ def main(args):
                 #     )
                 #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
-                lr_scheduler.step()
+                # lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 loss_avg.update(loss.detach_(), bsz)
+                lr_scheduler.step(loss_avg.avg)
 
             if not global_step % args.log_interval:
                 logs = {"loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -756,10 +777,8 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
-            
 
         accelerator.wait_for_everyone()
-
 
     save_weights(global_step)
 
