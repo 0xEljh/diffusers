@@ -592,7 +592,7 @@ def main(args):
     lr_scheduler = LRReduceOnPlateauComposer(
         lr_scheduler,
         mode="min",
-        factor=0.5,
+        factor=0.8,
         patience=100,
         cooldown=50,
         verbose=True,
@@ -767,7 +767,7 @@ def main(args):
                 logs = {"loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
-                wandb.log({"step": global_step, "loss": loss_avg.avg.item()})
+                wandb.log({"step": global_step, "loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]})
 
             if global_step > 0 and not global_step % args.save_interval and global_step >= args.save_min_steps:
                 save_weights(global_step)
