@@ -1,3 +1,4 @@
+# this line is for WSL:
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 
 accelerate launch train_dreambooth.py \
@@ -13,7 +14,7 @@ accelerate launch train_dreambooth.py \
   --train_batch_size=1 \
   --sample_batch_size=1 \
   --gradient_accumulation_steps=1 --gradient_checkpointing \
-  --learning_rate=1e-6 \
+  --learning_rate=2e-6 \
   --lr_scheduler="cosine" \
   --lr_warmup_steps=100 \
   --max_train_steps=1000 \

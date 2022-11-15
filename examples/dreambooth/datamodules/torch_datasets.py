@@ -75,11 +75,18 @@ class DreamBoothDataset(Dataset):
                 transforms.RandomApply(
                     torch.nn.ModuleList(
                         [
-                            transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2, hue=0.1),
-                            transforms.RandomAffine(degrees=(-10, 10), translate=(0.2, 0.2), scale=(0.8, 1.2)),
+                            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
                         ]
                     ),
-                    p=0.1,
+                    p=0.2,
+                ),
+                transforms.RandomApply(
+                    torch.nn.ModuleList(
+                        [
+                            transforms.RandomAffine(degrees=(-10, 10), translate=(0.1, 0.1), scale=(0.8, 1.2)),
+                        ]
+                    ),
+                    p=0.5,
                 ),
                 transforms.RandomGrayscale(p=0.02),  # might be useful for the model to learn the color of the object
                 transforms.ToTensor(),
@@ -96,13 +103,20 @@ class DreamBoothDataset(Dataset):
                 transforms.RandomApply(
                     torch.nn.ModuleList(
                         [
-                            transforms.ColorJitter(brightness=0.4, contrast=0.3, saturation=0.3, hue=0.2),
+                            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
+                        ]
+                    ),
+                    p=0.8,
+                ),
+                transforms.RandomApply(
+                    torch.nn.ModuleList(
+                        [
                             transforms.RandomAffine(degrees=(-20, 20), translate=(0.2, 0.2), scale=(0.8, 1.2)),
                         ]
                     ),
-                    p=0.7,
+                    p=0.8,
                 ),
-                transforms.RandomGrayscale(p=0.1),  # might be useful for the model to learn the color of the object
+                transforms.RandomGrayscale(p=0.05),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
