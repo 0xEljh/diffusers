@@ -1,0 +1,15 @@
+cd diffusers # navigate to main parent diffusers directory
+pip install .
+
+conda install pytorch torchvision pytorch-cuda=11.7 -c pytorch -c nvidia
+
+cd examples/dreambooth
+pip install -r requirements.txt
+
+pip install -U --pre triton
+pip install ninja bitsandbytes
+
+pip install git+https://github.com/facebookresearch/xformers@1d31a3a#egg=xformers
+
+accelerate config
+huggingface-cli login

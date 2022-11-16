@@ -31,7 +31,7 @@ def main(args):
     model_id = args.model
     # make no assumptions about model datatype.
     # not possible to use more vram than training
-    pipe = StableDiffusionPipeline.from_pretrained(model_id).to("cuda")
+    pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float32).to("cuda")
     if args.prompt == "all":
         prompt = ["sks person " + x for x in prompt_templates.values()]
     else:
